@@ -1113,6 +1113,7 @@ class BehaviorRepository:
                 raise ValueError("target link set is incomplete or contains non-target links")
 
             already_switched = True
+            switched_link_ids = set()
             for link_id, target in requested.items():
                 row = actual_by_id[link_id]
                 if row["companion_id"] != companion_id:
@@ -1127,10 +1128,14 @@ class BehaviorRepository:
                 if row["behavior_id"] != target["expected_behavior_id"]:
                     if row["behavior_id"] != new_behavior_id:
                         raise ValueError("expected behavior_id changed")
+                    switched_link_ids.add(link_id)
                 else:
                     already_switched = False
                 if row["relationship_id"] is not None:
                     relationship_ids.add(row["relationship_id"])
+
+            if switched_link_ids and not already_switched:
+                raise ValueError("expected behavior_id changed")
 
             if not already_switched:
                 active_jobs = await conn.fetchval(
