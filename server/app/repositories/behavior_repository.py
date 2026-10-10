@@ -1041,3 +1041,134 @@ class BehaviorRepository:
             )
             return True
         return False
+
+    @staticmethod
+    async def switch_companion_behavior_links(
+        conn: asyncpg.Connection,
+        *,
+        companion_id: UUID,
+        project_id: UUID,
+        behavior_key: str,
+        new_behavior_id: UUID,
+        targets: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Atomically compare-and-swap an exact companion behavior link set.
+
+        This transaction does not drain runtime work or notify remote caches;
+        callers must keep live switching disabled until those guarantees exist.
+        """
+        requested: dict[UUID, Dict[str, Any]] = {}
+        for target in targets:
+            link_id = target["link_id"]
+            if link_id in requested:
+                raise ValueError("duplicate target link_id")
+            if target["expected_behavior_id"] == new_behavior_id:
+                raise ValueError("expected behavior_id must differ from the new definition")
+            requested[link_id] = target
+        if not requested:
+            raise ValueError("at least one target link is required")
+
+        relationship_ids: set[UUID] = set()
+        async with conn.transaction():
+            # Existing API link writers take ROW EXCLUSIVE locks. Serialize the
+            # inventory and swap with them so the override set cannot drift.
+            await conn.execute(
+                "LOCK TABLE companion_behavior_links IN SHARE ROW EXCLUSIVE MODE"
+            )
+            companion = await conn.fetchrow(
+                "SELECT project_id FROM companions WHERE id = $1 FOR SHARE",
+                companion_id,
+            )
+            if not companion or companion["project_id"] != project_id:
+                raise ValueError("companion is missing or outside the project")
+
+            new_definition = await conn.fetchrow(
+                "SELECT id, project_id, key FROM behaviors WHERE id = $1 FOR SHARE",
+                new_behavior_id,
+            )
+            if not new_definition or new_definition["project_id"] != project_id:
+                raise ValueError("new behavior definition is missing or outside the project")
+            if new_definition["key"] == behavior_key:
+                raise ValueError("new definition must use a fresh behavior key")
+
+            actual_rows = await conn.fetch(
+                """
+                SELECT cbl.id AS link_id, cbl.companion_id, cbl.relationship_id,
+                       cbl.behavior_id, b.key AS behavior_key,
+                       r.companion_id AS relationship_companion_id
+                FROM companion_behavior_links cbl
+                JOIN behaviors b ON b.id = cbl.behavior_id
+                LEFT JOIN relationships r ON r.id = cbl.relationship_id
+                WHERE cbl.companion_id = $1
+                  AND b.key IN ($2, $3)
+                ORDER BY cbl.id
+                FOR UPDATE OF cbl
+                """,
+                companion_id,
+                behavior_key,
+                new_definition["key"],
+            )
+            actual_by_id = {row["link_id"]: row for row in actual_rows}
+            if set(actual_by_id) != set(requested):
+                raise ValueError("target link set is incomplete or contains non-target links")
+
+            already_switched = True
+            for link_id, target in requested.items():
+                row = actual_by_id[link_id]
+                if row["companion_id"] != companion_id:
+                    raise ValueError("target link belongs to a different companion")
+                if row["relationship_id"] != target["relationship_id"]:
+                    raise ValueError("target relationship scope changed")
+                if (
+                    row["relationship_id"] is not None
+                    and row["relationship_companion_id"] != companion_id
+                ):
+                    raise ValueError("relationship override belongs to another companion")
+                if row["behavior_id"] != target["expected_behavior_id"]:
+                    if row["behavior_id"] != new_behavior_id:
+                        raise ValueError("expected behavior_id changed")
+                else:
+                    already_switched = False
+                if row["relationship_id"] is not None:
+                    relationship_ids.add(row["relationship_id"])
+
+            if not already_switched:
+                active_jobs = await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM jobs
+                        WHERE companion_id = $1
+                          AND behavior_key = $2
+                          AND status IN ('pending', 'claimed', 'running')
+                    )
+                    """,
+                    companion_id,
+                    behavior_key,
+                )
+                if active_jobs:
+                    raise ValueError("active behavior jobs must be drained before switching")
+
+                for link_id, target in requested.items():
+                    if actual_by_id[link_id]["behavior_id"] == new_behavior_id:
+                        continue
+                    changed = await conn.fetchval(
+                        """
+                        UPDATE companion_behavior_links
+                        SET behavior_id = $1, updated_at = NOW()
+                        WHERE id = $2 AND companion_id = $3 AND behavior_id = $4
+                        RETURNING id
+                        """,
+                        new_behavior_id,
+                        link_id,
+                        companion_id,
+                        target["expected_behavior_id"],
+                    )
+                    if changed is None:
+                        raise ValueError("link compare-and-swap failed")
+
+        # Cache invalidation is process-local. It is useful for local callers,
+        # but not sufficient as a live cutover protocol across worker replicas.
+        BehaviorRepository.invalidate_behavior_cache(companion_id)
+        for relationship_id in relationship_ids:
+            BehaviorRepository.invalidate_behavior_cache(companion_id, relationship_id)
+        return {"switched": len(requested), "already_switched": already_switched}

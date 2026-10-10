@@ -30,10 +30,12 @@ from ...db import get_db
 from ...models.v2.behavior import (
     BehaviorLinkCreate,
     BehaviorLinkResponse,
+    BehaviorLinkSwitchRequest,
     BehaviorLinkUpdate,
     BehaviorResponse,
     BehaviorUpdate,
     CompanionBehaviorsResponse,
+    IsolatedBehaviorDefinitionCreate,
     RelationshipBehaviorsResponse,
     TriggerBehaviorRequest,
     TriggerBehaviorResponse,
@@ -139,6 +141,79 @@ def _to_behavior_response(behavior: Dict[str, Any]) -> BehaviorResponse:
 # -----------------------------------------------------------------------------
 # Companion-Level Behavior Endpoints
 # -----------------------------------------------------------------------------
+
+
+@router.post(
+    "/companions/{companion_id}/behavior-definitions",
+    response_model=BehaviorResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a fresh behavior definition",
+    description="Create a new project-scoped definition; existing keys are never reused.",
+)
+async def create_isolated_behavior_definition(
+    companion_id: UUID,
+    body: IsolatedBehaviorDefinitionCreate,
+    subject: ProjectApiKeySubject = Depends(get_project_api_subject),
+    conn: asyncpg.Connection = Depends(get_db),
+):
+    """Create a fresh definition for a companion's later explicit link switch."""
+    await _verify_companion_access(conn, companion_id, subject.project.id)
+    existing = await BehaviorRepository.get_behavior_by_project_key(
+        conn, project_id=subject.project.id, behavior_key=body.key
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Behavior key already exists; definition reuse is not allowed here",
+        )
+    try:
+        async with conn.transaction():
+            created = await BehaviorRepository.create_behavior(
+                conn,
+                behavior_id=uuid4(),
+                project_id=subject.project.id,
+                key=body.key,
+                name=body.name,
+                description=body.description,
+                source_code=body.source_code,
+                dependencies=body.dependencies,
+                timeout_seconds=body.timeout_seconds,
+                block_network=body.block_network,
+            )
+    except asyncpg.UniqueViolationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Behavior key already exists; definition reuse is not allowed here",
+        ) from exc
+    return _to_behavior_response(created)
+
+
+@router.post(
+    "/companions/{companion_id}/behaviors/{behavior_key}/switch",
+    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+    summary="Switch behavior definition (disabled until runtime drain is supported)",
+)
+async def switch_companion_behavior_definition(
+    companion_id: UUID,
+    behavior_key: str,
+    body: BehaviorLinkSwitchRequest,
+    subject: ProjectApiKeySubject = Depends(get_project_api_subject),
+    conn: asyncpg.Connection = Depends(get_db),
+):
+    """Fail closed until distributed execution drain/cache invalidation exists."""
+    await _verify_companion_access(conn, companion_id, subject.project.id)
+    if body.behavior_key != behavior_key:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Request behavior_key must match the URL",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=(
+            "Live behavior switching is disabled: the runtime cannot yet block new executions, "
+            "confirm all in-flight jobs are drained, or invalidate caches across worker processes"
+        ),
+    )
 
 
 @router.get(
