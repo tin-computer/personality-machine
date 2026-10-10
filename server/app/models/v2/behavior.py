@@ -239,6 +239,38 @@ class BehaviorLinkUpdate(BaseModel):
     params: Dict[str, Any] | None = None
 
 
+class BehaviorLinkSwitchTarget(BaseModel):
+    """One explicitly scoped default or relationship override link."""
+
+    link_id: UUID
+    relationship_id: UUID | None = None
+    expected_behavior_id: UUID
+
+
+class IsolatedBehaviorDefinitionCreate(BaseModel):
+    """Create a fresh project definition without reusing an existing key."""
+
+    key: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    description: str | None = None
+    source_code: str = ""
+    dependencies: List[str] = Field(default_factory=list)
+    timeout_seconds: int = Field(60, ge=1, le=600)
+    block_network: bool = True
+
+
+class BehaviorLinkSwitchRequest(BaseModel):
+    """Compare-and-swap request for a companion behavior link.
+
+    Relationship override links must be named explicitly. The server rejects
+    incomplete or stale scopes instead of guessing which overrides to move.
+    """
+
+    behavior_key: str = Field(..., min_length=1)
+    new_behavior_id: UUID
+    links: List[BehaviorLinkSwitchTarget] = Field(..., min_length=1)
+
+
 class BehaviorLink(BehaviorLinkBase):
     """Full behavior link model."""
 

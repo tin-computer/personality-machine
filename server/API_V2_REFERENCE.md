@@ -2464,6 +2464,43 @@ Source code is **not** set here. After linking, upload the code with
 
 **Response** `201 Created` — returns the behavior link (same shape as list items above).
 
+#### Create a Fresh Behavior Definition
+
+```http
+POST /v2/companions/{companion_id}/behavior-definitions
+Content-Type: application/json
+
+{
+  "key": "relationship_update_step06_v1",
+  "name": "Relationship update v1",
+  "source_code": "async def execute(ctx): return None"
+}
+```
+
+This creates a new project-scoped definition and never links or updates an
+existing definition. An existing project key returns `409 Conflict`.
+
+#### Switch a Behavior Definition
+
+```http
+POST /v2/companions/{companion_id}/behaviors/{behavior_key}/switch
+Content-Type: application/json
+
+{
+  "behavior_key": "relationship_update",
+  "new_behavior_id": "...",
+  "links": [
+    {"link_id": "...", "relationship_id": null, "expected_behavior_id": "..."},
+    {"link_id": "...", "relationship_id": "...", "expected_behavior_id": "..."}
+  ]
+}
+```
+
+This endpoint currently returns `503 Service Unavailable` and performs no
+mutation. The runtime has no distributed execution gate, in-flight job drain,
+or cross-worker cache invalidation contract. The repository's transactional
+compare-and-swap is not a live cutover API until those gates are implemented.
+
 ---
 
 #### Update Behavior Definition (source code)
